@@ -1,5 +1,6 @@
 #![no_std]
 mod events;
+mod analytics;
 
 #[cfg(test)]
 mod test_rbac;
@@ -9,6 +10,12 @@ use events::{
     emit_funds_refunded, emit_funds_released, BatchFundsLocked, BatchFundsReleased,
     BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted, FundsLocked,
     FundsRefunded, FundsReleased, EVENT_VERSION_V2,
+};
+use analytics::{
+    emit_analytics_snapshot, emit_bounty_activity, emit_bounty_state_transitioned,
+    get_bounty_analytics, init_bounty_analytics, update_analytics_on_refund,
+    update_analytics_on_release, BountyActivityEvent, BountyStateTransitioned, ContractAnalytics,
+    AnalyticsSnapshot,
 };
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, vec, Address, Env,
@@ -934,7 +941,37 @@ impl BountyEscrowContract {
             &depositor_index,
         );
 
-        // Emit value allows for off-chain indexing
+        // Initialize analytics for this bounty
+        let timestamp = env.ledger().timestamp();
+        init_bounty_analytics(&env, bounty_id, amount, timestamp);
+
+        // Emit state transition event
+        emit_bounty_state_transitioned(
+            &env,
+            BountyStateTransitioned {
+                version: analytics::ANALYTICS_VERSION_V1,
+                bounty_id,
+                previous_state: symbol_short!("new"),
+                new_state: symbol_short!("locked"),
+                amount,
+                actor: depositor.clone(),
+                timestamp,
+            },
+        );
+
+        // Emit activity event
+        emit_bounty_activity(
+            &env,
+            BountyActivityEvent {
+                version: analytics::ANALYTICS_VERSION_V1,
+                bounty_id,
+                activity_type: symbol_short!("created"),
+                amount,
+                timestamp,
+            },
+        );
+
+        // Emit traditional event for backward compatibility
         emit_funds_locked(
             &env,
             FundsLocked {
@@ -1010,6 +1047,37 @@ impl BountyEscrowContract {
             .persistent()
             .set(&DataKey::Escrow(bounty_id), &escrow);
 
+        let timestamp = env.ledger().timestamp();
+
+        // Update analytics
+        update_analytics_on_release(&env, bounty_id, escrow.amount, timestamp);
+
+        // Emit state transition event
+        emit_bounty_state_transitioned(
+            &env,
+            BountyStateTransitioned {
+                version: analytics::ANALYTICS_VERSION_V1,
+                bounty_id,
+                previous_state: symbol_short!("locked"),
+                new_state: symbol_short!("released"),
+                amount: escrow.amount,
+                actor: admin.clone(),
+                timestamp,
+            },
+        );
+
+        // Emit activity event
+        emit_bounty_activity(
+            &env,
+            BountyActivityEvent {
+                version: analytics::ANALYTICS_VERSION_V1,
+                bounty_id,
+                activity_type: symbol_short!("released"),
+                amount: escrow.amount,
+                timestamp,
+            },
+        );
+
         emit_funds_released(
             &env,
             FundsReleased {
@@ -1017,7 +1085,7 @@ impl BountyEscrowContract {
                 bounty_id,
                 amount: escrow.amount,
                 recipient: contributor.clone(),
-                timestamp: env.ledger().timestamp(),
+                timestamp,
             },
         );
 
@@ -1437,6 +1505,44 @@ impl BountyEscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::Escrow(bounty_id), &escrow);
+
+        // Update analytics
+        update_analytics_on_refund(&env, bounty_id, refund_amount, now);
+
+        // Emit state transition event
+        let new_state = if is_full || escrow.remaining_amount == 0 {
+            symbol_short!("refunded")
+        } else {
+            symbol_short!("partial_r")
+        };
+        emit_bounty_state_transitioned(
+            &env,
+            BountyStateTransitioned {
+                version: analytics::ANALYTICS_VERSION_V1,
+                bounty_id,
+                previous_state: symbol_short!("locked"),
+                new_state,
+                amount: refund_amount,
+                actor: refund_to.clone(),
+                timestamp: now,
+            },
+        );
+
+        // Emit activity event
+        emit_bounty_activity(
+            &env,
+            BountyActivityEvent {
+                version: analytics::ANALYTICS_VERSION_V1,
+                bounty_id,
+                activity_type: if is_full {
+                    symbol_short!("refunded")
+                } else {
+                    symbol_short!("part_ref")
+                },
+                amount: refund_amount,
+                timestamp: now,
+            },
+        );
 
         // Remove approval after successful execution
         if approval.is_some() {
@@ -2247,7 +2353,311 @@ impl BountyEscrowContract {
 
         Ok(released_count)
     }
+
+    // ==================== ANALYTICS VIEW FUNCTIONS ====================
+
+    /// Get per-bounty analytics for a specific bounty
+    ///
+    /// # Arguments
+    /// * `bounty_id` - The bounty to query
+    ///
+    /// # Returns
+    /// * `Ok(BountyAnalytics)` - Analytics for the bounty including amounts locked/released/refunded
+    /// * `Err(Error::BountyNotFound)` - If bounty doesn't exist
+    pub fn get_bounty_analytics(env: Env, bounty_id: u64) -> Result<analytics::BountyAnalytics, Error> {
+        get_bounty_analytics(&env, bounty_id).ok_or(Error::BountyNotFound)
+    }
+
+    /// Get contract-wide analytics snapshot
+    ///
+    /// Returns aggregated metrics about active bounties, total locked amounts, and released amounts.
+    /// This view is efficient and suitable for regular polling by off-chain indexers.
+    ///
+    /// # Returns
+    /// `ContractAnalytics` containing:
+    /// - Active bounty count (Locked or Partially Refunded)
+    /// - Released bounty count
+    /// - Refunded bounty count
+    /// - Total locked amount
+    /// - Total released amount
+    /// - Total refunded amount
+    /// - Average bounty size
+    pub fn get_contract_analytics(env: Env) -> ContractAnalytics {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+
+        let mut active_count = 0u32;
+        let mut released_count = 0u32;
+        let mut refunded_count = 0u32;
+        let mut total_locked = 0i128;
+        let mut total_released = 0i128;
+        let mut total_refunded = 0i128;
+
+        for i in 0..index.len() {
+            let bounty_id = index.get(i).unwrap();
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
+            {
+                match escrow.status {
+                    EscrowStatus::Locked | EscrowStatus::PartiallyRefunded => {
+                        active_count += 1;
+                        total_locked = total_locked.saturating_add(escrow.remaining_amount);
+                    }
+                    EscrowStatus::Released => {
+                        released_count += 1;
+                        total_released = total_released.saturating_add(escrow.amount);
+                    }
+                    EscrowStatus::Refunded => {
+                        refunded_count += 1;
+                        total_refunded = total_refunded.saturating_add(escrow.amount);
+                    }
+                }
+            }
+        }
+
+        let total_count = (active_count as i128)
+            .saturating_add(released_count as i128)
+            .saturating_add(refunded_count as i128);
+        let average_bounty = if total_count > 0 {
+            (total_locked
+                .saturating_add(total_released)
+                .saturating_add(total_refunded))
+                / total_count
+        } else {
+            0
+        };
+
+        ContractAnalytics {
+            active_bounty_count: active_count,
+            released_bounty_count: released_count,
+            refunded_bounty_count: refunded_count,
+            total_locked,
+            total_released,
+            total_refunded,
+            average_bounty_amount: average_bounty,
+            snapshot_timestamp: env.ledger().timestamp(),
+        }
+    }
+
+    /// Emit a contract analytics snapshot event
+    ///
+    /// This can be called periodically to create snapshots for off-chain analytics and indexing.
+    /// The event contains a full `ContractAnalytics` structure that can be ingested by indexing services.
+    pub fn emit_contract_analytics_snapshot(env: Env) {
+        let analytics = Self::get_contract_analytics(env.clone());
+        emit_analytics_snapshot(
+            &env,
+            AnalyticsSnapshot {
+                version: analytics::ANALYTICS_VERSION_V1,
+                metrics: analytics,
+            },
+        );
+    }
+
+    /// Count bounties by status
+    ///
+    /// # Returns
+    /// Number of bounties in the specified status
+    pub fn count_bounties_by_status(env: Env, status: EscrowStatus) -> u32 {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+
+        let mut count = 0u32;
+        for i in 0..index.len() {
+            let bounty_id = index.get(i).unwrap();
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
+            {
+                if escrow.status == status {
+                    count += 1;
+                }
+            }
+        }
+        count
+    }
+
+    /// Get total volume of funds by status
+    ///
+    /// Returns the sum of all funds in bounties with the specified status
+    pub fn get_volume_by_status(env: Env, status: EscrowStatus) -> i128 {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+
+        let mut total = 0i128;
+        for i in 0..index.len() {
+            let bounty_id = index.get(i).unwrap();
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
+            {
+                if escrow.status == status {
+                    let amount = match status {
+                        EscrowStatus::Locked | EscrowStatus::PartiallyRefunded => {
+                            escrow.remaining_amount
+                        }
+                        _ => escrow.amount,
+                    };
+                    total = total.saturating_add(amount);
+                }
+            }
+        }
+        total
+    }
+
+    /// Get statistics for a specific depositor
+    ///
+    /// Returns count and total amount of bounties created by the depositor
+    pub fn get_depositor_stats(
+        env: Env,
+        depositor: Address,
+    ) -> (u32, i128, u32, i128, u32, i128) {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::DepositorIndex(depositor.clone()))
+            .unwrap_or(Vec::new(&env));
+
+        let mut locked_count = 0u32;
+        let mut locked_amount = 0i128;
+        let mut released_count = 0u32;
+        let mut released_amount = 0i128;
+        let mut refunded_count = 0u32;
+        let mut refunded_amount = 0i128;
+
+        for i in 0..index.len() {
+            let bounty_id = index.get(i).unwrap();
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
+            {
+                match escrow.status {
+                    EscrowStatus::Locked | EscrowStatus::PartiallyRefunded => {
+                        locked_count += 1;
+                        locked_amount = locked_amount.saturating_add(escrow.remaining_amount);
+                    }
+                    EscrowStatus::Released => {
+                        released_count += 1;
+                        released_amount = released_amount.saturating_add(escrow.amount);
+                    }
+                    EscrowStatus::Refunded => {
+                        refunded_count += 1;
+                        refunded_amount = refunded_amount.saturating_add(escrow.amount);
+                    }
+                }
+            }
+        }
+
+        (
+            locked_count,
+            locked_amount,
+            released_count,
+            released_amount,
+            refunded_count,
+            refunded_amount,
+        )
+    }
+
+    /// Query bounties by expiration status (approaching or already expired)
+    ///
+    /// # Arguments
+    /// * `max_deadline` - Only return bounties with deadline <= this timestamp
+    /// * `offset` - Pagination offset
+    /// * `limit` - Maximum number of results
+    ///
+    /// # Returns
+    /// Vector of bounties sorted by deadline that match the criteria
+    pub fn query_expiring_bounties(env: Env, max_deadline: u64, offset: u32, limit: u32) -> Vec<u64> {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+
+        let mut results = Vec::new(&env);
+        let mut count = 0u32;
+        let mut skipped = 0u32;
+
+        for i in 0..index.len() {
+            if count >= limit {
+                break;
+            }
+
+            let bounty_id = index.get(i).unwrap();
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
+            {
+                // Only include locked/partially refunded bounties that are expiring
+                if (escrow.status == EscrowStatus::Locked
+                    || escrow.status == EscrowStatus::PartiallyRefunded)
+                    && escrow.deadline <= max_deadline
+                {
+                    if skipped < offset {
+                        skipped += 1;
+                        continue;
+                    }
+                    results.push_back(bounty_id);
+                    count += 1;
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Get high-value bounties (above a threshold) for risk monitoring
+    ///
+    /// # Arguments
+    /// * `min_amount` - Minimum amount to consider "high-value"
+    /// * `limit` - Maximum number of results
+    pub fn get_high_value_bounties(env: Env, min_amount: i128, limit: u32) -> Vec<u64> {
+        let index: Vec<u64> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EscrowIndex)
+            .unwrap_or(Vec::new(&env));
+
+        let mut results = Vec::new(&env);
+        let mut count = 0u32;
+
+        for i in 0..index.len() {
+            if count >= limit {
+                break;
+            }
+
+            let bounty_id = index.get(i).unwrap();
+            if let Some(escrow) = env
+                .storage()
+                .persistent()
+                .get::<DataKey, Escrow>(&DataKey::Escrow(bounty_id))
+            {
+                if escrow.amount >= min_amount {
+                    results.push_back(bounty_id);
+                    count += 1;
+                }
+            }
+        }
+
+        results
+    }
 }
+
 
 #[cfg(test)]
 mod test;
@@ -2268,3 +2678,5 @@ mod test_lifecycle;
 mod test_pause;
 #[cfg(test)]
 mod test_query_filters;
+#[cfg(test)]
+mod test_bounty_analytics;
