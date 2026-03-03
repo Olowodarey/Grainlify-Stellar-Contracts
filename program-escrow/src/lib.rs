@@ -164,6 +164,9 @@ mod test_granular_pause;
 #[cfg(test)]
 mod test_lifecycle;
 
+#[cfg(test)]
+mod test_analytics_events;
+
 // ── Step 2: Add these public contract functions to the ProgramEscrowContract
 //    impl block (alongside the existing admin functions) ──────────────────
 
@@ -306,6 +309,10 @@ const BATCH_PAYOUT: Symbol = symbol_short!("BatchPay");
 const PAYOUT: Symbol = symbol_short!("Payout");
 const EVENT_VERSION_V2: u32 = 2;
 const PAUSE_STATE_CHANGED: Symbol = symbol_short!("PauseSt");
+const AGGREGATE_STATS: Symbol = symbol_short!("AggStats");
+const LARGE_PAYOUT: Symbol = symbol_short!("LrgPay");
+const SCHEDULE_TRIGGERED: Symbol = symbol_short!("SchedTrg");
+const PROGRAM_REGISTERED: Symbol = symbol_short!("PrgReg");
 
 // Storage keys
 const PROGRAM_DATA: Symbol = symbol_short!("ProgData");
@@ -314,6 +321,9 @@ const RELEASE_HISTORY: Symbol = symbol_short!("RelHist");
 const NEXT_SCHEDULE_ID: Symbol = symbol_short!("NxtSched");
 const PROGRAM_INDEX: Symbol = symbol_short!("ProgIdx");
 const AUTH_KEY_INDEX: Symbol = symbol_short!("AuthIdx");
+const PROGRAM_REGISTRY: Symbol = symbol_short!("ProgReg");
+const FEE_CONFIG: Symbol = symbol_short!("FeeConf");
+const BASIS_POINTS: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,6 +370,39 @@ pub struct PayoutEvent {
     pub recipient: Address,
     pub amount: i128,
     pub remaining_balance: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AggregateStatsEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub total_funds: i128,
+    pub remaining_balance: i128,
+    pub total_paid_out: i128,
+    pub payout_count: u32,
+    pub scheduled_count: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LargePayoutEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub recipient: Address,
+    pub amount: i128,
+    pub threshold: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ScheduleTriggeredEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub schedule_id: u64,
+    pub recipient: Address,
+    pub amount: i128,
+    pub trigger_type: ReleaseType,
 }
 
 #[contracttype]
@@ -416,6 +459,15 @@ pub struct RateLimitConfig {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfig {
+    pub lock_fee_rate: i128,
+    pub payout_fee_rate: i128,
+    pub fee_recipient: Address,
+    pub fee_enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Analytics {
     pub total_locked: i128,
     pub total_released: i128,
@@ -459,9 +511,10 @@ pub struct ProgramReleaseHistory {
 pub struct ProgramAggregateStats {
     pub total_funds: i128,
     pub remaining_balance: i128,
-    pub authorized_payout_key: Address,
-    pub payout_history: Vec<PayoutRecord>,
-    pub token_address: Address,
+    pub total_paid_out: i128,
+    pub payout_count: u32,
+    pub scheduled_count: u32,
+    pub released_count: u32,
 }
 
 /// Input item for batch program registration.
@@ -484,20 +537,6 @@ pub enum BatchError {
     InvalidBatchSize = 1,
     ProgramAlreadyExists = 2,
     DuplicateProgramId = 3,
-}
-
-/// Storage key type for individual programs
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Program(String),                 // program_id -> ProgramData
-    ReleaseSchedule(String, u64),    // program_id, schedule_id -> ProgramReleaseSchedule
-    ReleaseHistory(String),          // program_id -> Vec<ProgramReleaseHistory>
-    NextScheduleId(String),          // program_id -> next schedule_id
-    MultisigConfig(String),          // program_id -> MultisigConfig
-    PayoutApproval(String, Address), // program_id, recipient -> PayoutApproval
-    PendingClaim(String, u64),       // (program_id, schedule_id) -> ClaimRecord
-    ClaimWindow,                     // u64 seconds (global config)
 }
 
 #[contracttype]
@@ -699,6 +738,52 @@ impl ProgramEscrowContract {
                 fee_enabled: false,
             })
     }
+
+    /// Emit aggregate statistics event
+    fn emit_aggregate_stats(env: &Env, program_data: &ProgramData) {
+        let schedules: Vec<ProgramReleaseSchedule> = env
+            .storage()
+            .instance()
+            .get(&SCHEDULES)
+            .unwrap_or_else(|| Vec::new(env));
+
+        let mut scheduled_count = 0u32;
+        for i in 0..schedules.len() {
+            if !schedules.get(i).unwrap().released {
+                scheduled_count += 1;
+            }
+        }
+
+        env.events().publish(
+            (AGGREGATE_STATS,),
+            AggregateStatsEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_data.program_id.clone(),
+                total_funds: program_data.total_funds,
+                remaining_balance: program_data.remaining_balance,
+                total_paid_out: program_data.total_funds - program_data.remaining_balance,
+                payout_count: program_data.payout_history.len(),
+                scheduled_count,
+            },
+        );
+    }
+
+    /// Check if payout is large and emit event if threshold exceeded
+    fn check_and_emit_large_payout(env: &Env, program_data: &ProgramData, recipient: &Address, amount: i128) {
+        let threshold = program_data.total_funds / 10; // 10% of total funds
+        if amount >= threshold {
+            env.events().publish(
+                (LARGE_PAYOUT,),
+                LargePayoutEvent {
+                    version: EVENT_VERSION_V2,
+                    program_id: program_data.program_id.clone(),
+                    recipient: recipient.clone(),
+                    amount,
+                    threshold,
+                },
+            );
+        }
+    }
     /// Check if a program exists
     ///
     /// # Returns
@@ -769,6 +854,11 @@ impl ProgramEscrowContract {
 
     pub fn set_admin(env: Env, admin: Address) {
         Self::initialize_contract(env, admin);
+    }
+
+    /// Get the current admin
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
     }
 
     /// Update pause flags (admin only)
@@ -986,6 +1076,9 @@ impl ProgramEscrowContract {
             let recipient = recipients.get(i).unwrap();
             let amount = amounts.get(i).unwrap();
 
+            // Check and emit large payout event
+            Self::check_and_emit_large_payout(&env, &program_data, &recipient, amount);
+
             // Transfer funds from contract to recipient
             token_client.transfer(&contract_address, &recipient, &amount);
 
@@ -1017,6 +1110,9 @@ impl ProgramEscrowContract {
                 remaining_balance: updated_data.remaining_balance,
             },
         );
+
+        // Emit aggregate stats
+        Self::emit_aggregate_stats(&env, &updated_data);
 
         // Clear reentrancy guard before returning
         reentrancy_guard::clear_entered(&env);
@@ -1066,6 +1162,9 @@ impl ProgramEscrowContract {
             panic!("Insufficient balance");
         }
 
+        // Check and emit large payout event
+        Self::check_and_emit_large_payout(&env, &program_data, &recipient, amount);
+
         // Transfer funds from contract to recipient
         let contract_address = env.current_contract_address();
         let token_client = token::Client::new(&env, &program_data.token_address);
@@ -1101,6 +1200,9 @@ impl ProgramEscrowContract {
                 remaining_balance: updated_data.remaining_balance,
             },
         );
+
+        // Emit aggregate stats
+        Self::emit_aggregate_stats(&env, &updated_data);
 
         // Clear reentrancy guard before returning
         reentrancy_guard::clear_entered(&env);
@@ -1239,11 +1341,25 @@ impl ProgramEscrowContract {
             });
             release_history.push_back(ProgramReleaseHistory {
                 schedule_id: schedule.schedule_id,
-                recipient: schedule.recipient,
+                recipient: schedule.recipient.clone(),
                 amount: schedule.amount,
                 released_at: now,
                 release_type: ReleaseType::Automatic,
             });
+
+            // Emit schedule triggered event
+            env.events().publish(
+                (SCHEDULE_TRIGGERED,),
+                ScheduleTriggeredEvent {
+                    version: EVENT_VERSION_V2,
+                    program_id: program_data.program_id.clone(),
+                    schedule_id: schedule.schedule_id,
+                    recipient: schedule.recipient.clone(),
+                    amount: schedule.amount,
+                    trigger_type: ReleaseType::Automatic,
+                },
+            );
+
             released_count += 1;
         }
 
@@ -1252,6 +1368,11 @@ impl ProgramEscrowContract {
         env.storage()
             .instance()
             .set(&RELEASE_HISTORY, &release_history);
+
+        // Emit aggregate stats if any releases occurred
+        if released_count > 0 {
+            Self::emit_aggregate_stats(&env, &program_data);
+        }
 
         // Clear reentrancy guard before returning
         reentrancy_guard::clear_entered(&env);
@@ -1687,8 +1808,21 @@ impl ProgramEscrowContract {
                 s.released_at = Some(now);
                 s.released_by = Some(caller.clone());
                 released_schedule = Some(s.clone());
-                schedules.set(i, s);
+                schedules.set(i, s.clone());
                 found = true;
+
+                // Emit schedule triggered event
+                env.events().publish(
+                    (SCHEDULE_TRIGGERED,),
+                    ScheduleTriggeredEvent {
+                        version: EVENT_VERSION_V2,
+                        program_id: program_data.program_id.clone(),
+                        schedule_id: s.schedule_id,
+                        recipient: s.recipient.clone(),
+                        amount: s.amount,
+                        trigger_type: ReleaseType::Manual,
+                    },
+                );
                 break;
             }
         }
@@ -1741,8 +1875,21 @@ impl ProgramEscrowContract {
                 s.released_at = Some(now);
                 s.released_by = Some(env.current_contract_address());
                 released_schedule = Some(s.clone());
-                schedules.set(i, s);
+                schedules.set(i, s.clone());
                 found = true;
+
+                // Emit schedule triggered event
+                env.events().publish(
+                    (SCHEDULE_TRIGGERED,),
+                    ScheduleTriggeredEvent {
+                        version: EVENT_VERSION_V2,
+                        program_id: program_data.program_id.clone(),
+                        schedule_id: s.schedule_id,
+                        recipient: s.recipient.clone(),
+                        amount: s.amount,
+                        trigger_type: ReleaseType::Automatic,
+                    },
+                );
                 break;
             }
         }
