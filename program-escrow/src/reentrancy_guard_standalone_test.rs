@@ -5,18 +5,27 @@
 
 #![cfg(test)]
 
-use crate::reentrancy_guard::*;
-use soroban_sdk::Env;
+use crate::{reentrancy_guard::*, ProgramEscrowContract};
+use soroban_sdk::{Address, Env};
+
+/// Helper to create an `Env` that is executing in a contract context.
+/// This makes the standalone guard tests match real Soroban execution,
+/// where storage is always scoped to a specific contract ID.
+fn contract_env() -> Env {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, ProgramEscrowContract);
+    env.as_contract(&contract_id)
+}
 
 #[test]
 fn test_guard_initially_not_set() {
-    let env = Env::default();
+    let env = contract_env();
     assert!(!is_entered(&env), "Guard should not be set initially");
 }
 
 #[test]
 fn test_guard_can_be_set_and_cleared() {
-    let env = Env::default();
+    let env = contract_env();
 
     // Initially not set
     assert!(!is_entered(&env));
@@ -35,7 +44,7 @@ fn test_guard_can_be_set_and_cleared() {
 
 #[test]
 fn test_check_passes_when_not_entered() {
-    let env = Env::default();
+    let env = contract_env();
 
     // Should not panic
     check_not_entered(&env);
@@ -44,7 +53,7 @@ fn test_check_passes_when_not_entered() {
 #[test]
 #[should_panic(expected = "Reentrancy detected")]
 fn test_check_panics_when_entered() {
-    let env = Env::default();
+    let env = contract_env();
 
     // Set the guard
     set_entered(&env);
@@ -55,7 +64,7 @@ fn test_check_panics_when_entered() {
 
 #[test]
 fn test_multiple_set_clear_cycles() {
-    let env = Env::default();
+    let env = contract_env();
 
     for _ in 0..5 {
         // Check passes
@@ -73,7 +82,7 @@ fn test_multiple_set_clear_cycles() {
 
 #[test]
 fn test_guard_state_persistence() {
-    let env = Env::default();
+    let env = contract_env();
 
     // Set guard
     set_entered(&env);
@@ -92,7 +101,7 @@ fn test_guard_state_persistence() {
 #[test]
 #[should_panic(expected = "Reentrancy detected")]
 fn test_double_set_detected() {
-    let env = Env::default();
+    let env = contract_env();
 
     // First set
     set_entered(&env);
@@ -103,7 +112,7 @@ fn test_double_set_detected() {
 
 #[test]
 fn test_clear_when_not_set_is_safe() {
-    let env = Env::default();
+    let env = contract_env();
 
     // Clearing when not set should be safe
     clear_entered(&env);
@@ -116,8 +125,13 @@ fn test_clear_when_not_set_is_safe() {
 
 #[test]
 fn test_guard_isolation_between_envs() {
-    let env1 = Env::default();
-    let env2 = Env::default();
+    let env1 = contract_env();
+    let env2 = {
+        // Use a different contract ID to ensure isolation between instances.
+        let env = Env::default();
+        let other_id = env.register_contract(None, ProgramEscrowContract);
+        env.as_contract(&other_id)
+    };
 
     // Set guard in env1
     set_entered(&env1);
@@ -143,7 +157,7 @@ fn test_guard_isolation_between_envs() {
 
 #[test]
 fn test_sequential_protected_operations() {
-    let env = Env::default();
+    let env = contract_env();
 
     // Simulate 3 sequential protected operations
     for i in 0..3 {

@@ -61,9 +61,8 @@ impl<'a> TestSetup<'a> {
     }
 }
 
-// Vulnerability: pending claims don't block refunds
 #[test]
-fn test_pending_claim_does_not_block_refund_vulnerability() {
+fn test_pending_claim_blocks_refund_after_fix() {
     let setup = TestSetup::new();
     let bounty_id = 1;
     let amount = 1000;
@@ -89,15 +88,15 @@ fn test_pending_claim_does_not_block_refund_vulnerability() {
     // Advance time PAST deadline
     setup.env.ledger().set_timestamp(deadline + 100);
 
-    // VULNERABILITY: Refund succeeds even though claim is pending
-    // This allows depositor to bypass the dispute
-    setup.escrow.refund(&bounty_id);
+    // After hardening: refund is blocked while claim is pending.
+    let res = setup.escrow.try_refund(&bounty_id);
+    assert!(res.is_err(), "refund should be blocked by pending claim");
 
-    // Verify funds were refunded
+    // Verify no funds moved and status is still Locked
     let escrow = setup.escrow.get_escrow_info(&bounty_id);
-    assert_eq!(escrow.status, EscrowStatus::Refunded);
-    assert_eq!(setup.token.balance(&setup.escrow.address), 0);
-    assert_eq!(setup.token.balance(&setup.depositor), 10_000_000);
+    assert_eq!(escrow.status, EscrowStatus::Locked);
+    assert_eq!(setup.token.balance(&setup.escrow.address), amount);
+    assert_eq!(setup.token.balance(&setup.depositor), 10_000_000 - amount);
     assert_eq!(setup.token.balance(&setup.contributor), 0);
 }
 

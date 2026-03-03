@@ -315,6 +315,12 @@ const NEXT_SCHEDULE_ID: Symbol = symbol_short!("NxtSched");
 const PROGRAM_INDEX: Symbol = symbol_short!("ProgIdx");
 const AUTH_KEY_INDEX: Symbol = symbol_short!("AuthIdx");
 
+// Additional constants and keys used by batch registration & fee config
+const PROGRAM_REGISTRY: Symbol = symbol_short!("ProgReg");
+const PROGRAM_REGISTERED: Symbol = symbol_short!("ProgRegd");
+const FEE_CONFIG: Symbol = symbol_short!("FeeCfg");
+const BASIS_POINTS: i128 = 10_000;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PayoutRecord {
@@ -426,6 +432,23 @@ pub struct Analytics {
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MultisigConfig {
+    pub threshold_amount: i128,
+    pub signers: Vec<Address>,
+    pub required_signatures: u32,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeeConfig {
+    pub lock_fee_rate: i128,
+    pub payout_fee_rate: i128,
+    pub fee_recipient: Address,
+    pub fee_enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramReleaseSchedule {
     pub schedule_id: u64,
     pub recipient: Address,
@@ -462,6 +485,11 @@ pub struct ProgramAggregateStats {
     pub authorized_payout_key: Address,
     pub payout_history: Vec<PayoutRecord>,
     pub token_address: Address,
+    // Aggregated counters for advanced analytics
+    pub total_paid_out: i128,
+    pub payout_count: u32,
+    pub scheduled_count: u32,
+    pub released_count: u32,
 }
 
 /// Input item for batch program registration.
@@ -484,41 +512,6 @@ pub enum BatchError {
     InvalidBatchSize = 1,
     ProgramAlreadyExists = 2,
     DuplicateProgramId = 3,
-}
-
-/// Storage key type for individual programs
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum DataKey {
-    Program(String),                 // program_id -> ProgramData
-    ReleaseSchedule(String, u64),    // program_id, schedule_id -> ProgramReleaseSchedule
-    ReleaseHistory(String),          // program_id -> Vec<ProgramReleaseHistory>
-    NextScheduleId(String),          // program_id -> next schedule_id
-    MultisigConfig(String),          // program_id -> MultisigConfig
-    PayoutApproval(String, Address), // program_id, recipient -> PayoutApproval
-    PendingClaim(String, u64),       // (program_id, schedule_id) -> ClaimRecord
-    ClaimWindow,                     // u64 seconds (global config)
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MultisigConfig {
-    pub threshold_amount: i128,
-    pub signers: Vec<Address>,
-    pub required_signatures: u32,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PayoutApproval {
-    pub program_id: String,
-    pub recipient: Address,
-    pub amount: i128,
-    pub approvals: Vec<Address>,
-    pub total_paid_out: i128,
-    pub payout_count: u32,
-    pub scheduled_count: u32,
-    pub released_count: u32,
 }
 
 #[contract]
@@ -1524,6 +1517,9 @@ impl ProgramEscrowContract {
         ProgramAggregateStats {
             total_funds: program_data.total_funds,
             remaining_balance: program_data.remaining_balance,
+            authorized_payout_key: program_data.authorized_payout_key.clone(),
+            payout_history: program_data.payout_history.clone(),
+            token_address: program_data.token_address.clone(),
             total_paid_out: program_data.total_funds - program_data.remaining_balance,
             payout_count: program_data.payout_history.len(),
             scheduled_count,

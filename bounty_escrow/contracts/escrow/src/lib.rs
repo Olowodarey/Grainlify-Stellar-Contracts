@@ -932,6 +932,16 @@ impl BountyEscrowContract {
         if Self::check_paused(&env, symbol_short!("release")) {
             return Err(Error::FundsPaused);
         }
+
+        // Dispute protection: if a pending claim exists for this bounty,
+        // the dispute must be resolved (claim or cancel) before any direct release.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingClaim(bounty_id))
+        {
+            return Err(Error::RefundNotApproved);
+        }
         let _start = env.ledger().timestamp();
 
         // Ensure contract is initialized
@@ -1250,6 +1260,15 @@ impl BountyEscrowContract {
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        // Dispute protection: block partial releases while a dispute (pending claim) is open.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingClaim(bounty_id))
+        {
+            return Err(Error::RefundNotApproved);
+        }
+
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyNotFound);
         }
@@ -1319,6 +1338,16 @@ impl BountyEscrowContract {
 
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyNotFound);
+        }
+
+        // Dispute protection: an open pending claim represents an unresolved dispute.
+        // Refunds are blocked until the claim is explicitly cancelled.
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingClaim(bounty_id))
+        {
+            return Err(Error::RefundNotApproved);
         }
 
         let mut escrow: Escrow = env
@@ -2012,6 +2041,15 @@ impl BountyEscrowContract {
             // Check if funds are locked
             if escrow.status != EscrowStatus::Locked {
                 return Err(Error::FundsNotLocked);
+            }
+
+            // Dispute protection: batch release must also respect open disputes.
+            if env
+                .storage()
+                .persistent()
+                .has(&DataKey::PendingClaim(item.bounty_id))
+            {
+                return Err(Error::RefundNotApproved);
             }
 
             // Check for duplicate bounty_ids in the batch
