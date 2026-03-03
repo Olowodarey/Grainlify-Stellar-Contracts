@@ -6,182 +6,184 @@
 #![cfg(test)]
 
 use crate::{reentrancy_guard::*, ProgramEscrowContract};
-use soroban_sdk::{Address, Env};
+use soroban_sdk::Env;
 
-/// Helper to create an `Env` that is executing in a contract context.
-/// This makes the standalone guard tests match real Soroban execution,
-/// where storage is always scoped to a specific contract ID.
-fn contract_env() -> Env {
+/// Helper to execute a closure within a contract context.
+fn with_contract_env<F, T>(f: F) -> T
+where
+    F: FnOnce(Env) -> T,
+{
     let env = Env::default();
     let contract_id = env.register_contract(None, ProgramEscrowContract);
-    env.as_contract(&contract_id)
+    env.as_contract(&contract_id, || f(env.clone()))
 }
 
 #[test]
 fn test_guard_initially_not_set() {
-    let env = contract_env();
-    assert!(!is_entered(&env), "Guard should not be set initially");
+    with_contract_env(|env| {
+        assert!(!is_entered(&env), "Guard should not be set initially");
+    });
 }
 
 #[test]
 fn test_guard_can_be_set_and_cleared() {
-    let env = contract_env();
+    with_contract_env(|env| {
+        // Initially not set
+        assert!(!is_entered(&env));
 
-    // Initially not set
-    assert!(!is_entered(&env));
+        // Set the guard
+        set_entered(&env);
+        assert!(is_entered(&env), "Guard should be set after set_entered");
 
-    // Set the guard
-    set_entered(&env);
-    assert!(is_entered(&env), "Guard should be set after set_entered");
-
-    // Clear the guard
-    clear_entered(&env);
-    assert!(
-        !is_entered(&env),
-        "Guard should be cleared after clear_entered"
-    );
+        // Clear the guard
+        clear_entered(&env);
+        assert!(
+            !is_entered(&env),
+            "Guard should be cleared after clear_entered"
+        );
+    });
 }
 
 #[test]
 fn test_check_passes_when_not_entered() {
-    let env = contract_env();
-
-    // Should not panic
-    check_not_entered(&env);
+    with_contract_env(|env| {
+        // Should not panic
+        check_not_entered(&env);
+    });
 }
 
 #[test]
 #[should_panic(expected = "Reentrancy detected")]
 fn test_check_panics_when_entered() {
-    let env = contract_env();
+    with_contract_env(|env| {
+        // Set the guard
+        set_entered(&env);
 
-    // Set the guard
-    set_entered(&env);
-
-    // This should panic
-    check_not_entered(&env);
+        // This should panic
+        check_not_entered(&env);
+    });
 }
 
 #[test]
 fn test_multiple_set_clear_cycles() {
-    let env = contract_env();
+    with_contract_env(|env| {
+        for _ in 0..5 {
+            // Check passes
+            check_not_entered(&env);
 
-    for _ in 0..5 {
-        // Check passes
-        check_not_entered(&env);
+            // Set guard
+            set_entered(&env);
+            assert!(is_entered(&env));
 
-        // Set guard
-        set_entered(&env);
-        assert!(is_entered(&env));
-
-        // Clear guard
-        clear_entered(&env);
-        assert!(!is_entered(&env));
-    }
+            // Clear guard
+            clear_entered(&env);
+            assert!(!is_entered(&env));
+        }
+    });
 }
 
 #[test]
 fn test_guard_state_persistence() {
-    let env = contract_env();
+    with_contract_env(|env| {
+        // Set guard
+        set_entered(&env);
 
-    // Set guard
-    set_entered(&env);
+        // Verify it persists across multiple checks
+        assert!(is_entered(&env));
+        assert!(is_entered(&env));
+        assert!(is_entered(&env));
 
-    // Verify it persists across multiple checks
-    assert!(is_entered(&env));
-    assert!(is_entered(&env));
-    assert!(is_entered(&env));
-
-    // Clear and verify
-    clear_entered(&env);
-    assert!(!is_entered(&env));
-    assert!(!is_entered(&env));
+        // Clear and verify
+        clear_entered(&env);
+        assert!(!is_entered(&env));
+        assert!(!is_entered(&env));
+    });
 }
 
 #[test]
 #[should_panic(expected = "Reentrancy detected")]
 fn test_double_set_detected() {
-    let env = contract_env();
+    with_contract_env(|env| {
+        // First set
+        set_entered(&env);
 
-    // First set
-    set_entered(&env);
-
-    // Check should fail
-    check_not_entered(&env);
+        // Check should fail
+        check_not_entered(&env);
+    });
 }
 
 #[test]
 fn test_clear_when_not_set_is_safe() {
-    let env = contract_env();
+    with_contract_env(|env| {
+        // Clearing when not set should be safe
+        clear_entered(&env);
+        assert!(!is_entered(&env));
 
-    // Clearing when not set should be safe
-    clear_entered(&env);
-    assert!(!is_entered(&env));
-
-    // Can still set after clearing
-    set_entered(&env);
-    assert!(is_entered(&env));
+        // Can still set after clearing
+        set_entered(&env);
+        assert!(is_entered(&env));
+    });
 }
 
 #[test]
 fn test_guard_isolation_between_envs() {
-    let env1 = contract_env();
-    let env2 = {
-        // Use a different contract ID to ensure isolation between instances.
-        let env = Env::default();
-        let other_id = env.register_contract(None, ProgramEscrowContract);
-        env.as_contract(&other_id)
-    };
+    let env = Env::default();
+    let contract_id_1 = env.register_contract(None, ProgramEscrowContract);
+    let contract_id_2 = env.register_contract(None, ProgramEscrowContract);
 
-    // Set guard in env1
-    set_entered(&env1);
+    // Set guard in contract 1
+    env.as_contract(&contract_id_1, || {
+        set_entered(&env);
+        assert!(is_entered(&env));
+    });
 
-    // env2 should not be affected
-    assert!(is_entered(&env1));
-    assert!(!is_entered(&env2));
-
-    // Set guard in env2
-    set_entered(&env2);
+    // Contract 2 should not be affected
+    env.as_contract(&contract_id_2, || {
+        assert!(!is_entered(&env));
+        set_entered(&env);
+        assert!(is_entered(&env));
+    });
 
     // Both should be set
-    assert!(is_entered(&env1));
-    assert!(is_entered(&env2));
+    env.as_contract(&contract_id_1, || {
+        assert!(is_entered(&env));
+        clear_entered(&env);
+        assert!(!is_entered(&env));
+    });
 
-    // Clear env1
-    clear_entered(&env1);
-
-    // Only env1 should be cleared
-    assert!(!is_entered(&env1));
-    assert!(is_entered(&env2));
+    // Contract 2 should still be set
+    env.as_contract(&contract_id_2, || {
+        assert!(is_entered(&env));
+    });
 }
 
 #[test]
 fn test_sequential_protected_operations() {
-    let env = contract_env();
+    with_contract_env(|env| {
+        // Simulate 3 sequential protected operations
+        for i in 0..3 {
+            // Check guard is clear
+            check_not_entered(&env);
 
-    // Simulate 3 sequential protected operations
-    for i in 0..3 {
-        // Check guard is clear
-        check_not_entered(&env);
+            // Set guard (operation starts)
+            set_entered(&env);
 
-        // Set guard (operation starts)
-        set_entered(&env);
+            // Verify guard is set
+            assert!(
+                is_entered(&env),
+                "Guard should be set during operation {}",
+                i
+            );
 
-        // Verify guard is set
-        assert!(
-            is_entered(&env),
-            "Guard should be set during operation {}",
-            i
-        );
+            // Clear guard (operation completes)
+            clear_entered(&env);
 
-        // Clear guard (operation completes)
-        clear_entered(&env);
-
-        // Verify guard is cleared
-        assert!(
-            !is_entered(&env),
-            "Guard should be cleared after operation {}",
-            i
-        );
-    }
+            // Verify guard is cleared
+            assert!(
+                !is_entered(&env),
+                "Guard should be cleared after operation {}",
+                i
+            );
+        }
+    });
 }

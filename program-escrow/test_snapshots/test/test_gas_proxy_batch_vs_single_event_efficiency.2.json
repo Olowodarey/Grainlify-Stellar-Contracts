@@ -779,6 +779,14 @@
                       },
                       {
                         "key": {
+                          "symbol": "ReentGrd"
+                        },
+                        "val": {
+                          "bool": false
+                        }
+                      },
+                      {
+                        "key": {
                           "symbol": "RelHist"
                         },
                         "val": {

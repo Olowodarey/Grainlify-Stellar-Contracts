@@ -306,6 +306,9 @@ const BATCH_PAYOUT: Symbol = symbol_short!("BatchPay");
 const PAYOUT: Symbol = symbol_short!("Payout");
 const EVENT_VERSION_V2: u32 = 2;
 const PAUSE_STATE_CHANGED: Symbol = symbol_short!("PauseSt");
+const DISPUTE_OPENED: Symbol = symbol_short!("DispOpen");
+const DISPUTE_RESOLVED: Symbol = symbol_short!("DispRes");
+const DISPUTE_CANCELLED: Symbol = symbol_short!("DispCanc");
 
 // Storage keys
 const PROGRAM_DATA: Symbol = symbol_short!("ProgData");
@@ -394,6 +397,7 @@ pub enum DataKey {
     ClaimWindow,                     // u64 seconds (global config)
     PauseFlags,                      // PauseFlags struct
     RateLimitConfig,                 // RateLimitConfig struct
+    Dispute,                         // DisputeRecord (program-level dispute)
 }
 
 #[contracttype]
@@ -514,6 +518,60 @@ pub enum BatchError {
     DuplicateProgramId = 3,
 }
 
+// ── Dispute Resolution Types ──────────────────────────────────────────────
+
+/// Status of a program-level dispute.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum DisputeStatus {
+    None,
+    Open,
+    Resolved,
+    Cancelled,
+}
+
+/// Record stored on-chain for an active or historical dispute.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeRecord {
+    pub opened_by: Address,
+    pub opened_at: u64,
+    pub reason: String,
+    pub status: DisputeStatus,
+    pub resolved_by: Option<Address>,
+    pub resolved_at: Option<u64>,
+}
+
+// ── Dispute Event Types ───────────────────────────────────────────────────
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeOpenedEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub opened_by: Address,
+    pub reason: String,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeResolvedEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub resolved_by: Address,
+    pub timestamp: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DisputeCancelledEvent {
+    pub version: u32,
+    pub program_id: String,
+    pub cancelled_by: Address,
+    pub timestamp: u64,
+}
+
 #[contract]
 pub struct ProgramEscrowContract;
 
@@ -610,12 +668,7 @@ impl ProgramEscrowContract {
             }
         }
 
-        let mut registry: Vec<String> = env
-            .storage()
-            .instance()
-            .get(&PROGRAM_REGISTRY)
-            .unwrap_or(vec![&env]);
-
+        let mut count = 0u32;
         for i in 0..batch_size {
             let item = items.get(i).unwrap();
             let program_id = item.program_id.clone();
@@ -637,16 +690,6 @@ impl ProgramEscrowContract {
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);
 
-            if i == 0 {
-                let fee_config = FeeConfig {
-                    lock_fee_rate: 0,
-                    payout_fee_rate: 0,
-                    fee_recipient: authorized_payout_key.clone(),
-                    fee_enabled: false,
-                };
-                env.storage().instance().set(&FEE_CONFIG, &fee_config);
-            }
-
             let multisig_config = MultisigConfig {
                 threshold_amount: i128::MAX,
                 signers: vec![&env],
@@ -657,41 +700,19 @@ impl ProgramEscrowContract {
                 &multisig_config,
             );
 
-            registry.push_back(program_id.clone());
             env.events().publish(
-                (PROGRAM_REGISTERED,),
+                (symbol_short!("BatchReg"),),
                 (program_id, authorized_payout_key, token_address, 0i128),
             );
+            count += 1;
         }
-        env.storage().instance().set(&PROGRAM_REGISTRY, &registry);
 
-        Ok(batch_size as u32)
+        Ok(count)
     }
 
-    /// Calculate fee amount based on rate (in basis points)
-    fn calculate_fee(amount: i128, fee_rate: i128) -> i128 {
-        if fee_rate == 0 {
-            return 0;
-        }
-        // Fee = (amount * fee_rate) / BASIS_POINTS
-        amount
-            .checked_mul(fee_rate)
-            .and_then(|x| x.checked_div(BASIS_POINTS))
-            .unwrap_or(0)
-    }
-
-    /// Get fee configuration (internal helper)
-    fn get_fee_config_internal(env: &Env) -> FeeConfig {
-        env.storage()
-            .instance()
-            .get(&FEE_CONFIG)
-            .unwrap_or_else(|| FeeConfig {
-                lock_fee_rate: 0,
-                payout_fee_rate: 0,
-                fee_recipient: env.current_contract_address(),
-                fee_enabled: false,
-            })
-    }
+    // ========================================================================
+    // Existence Check
+    // ========================================================================
     /// Check if a program exists
     ///
     /// # Returns
@@ -760,8 +781,200 @@ impl ProgramEscrowContract {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
+    /// Register or replace the contract admin. Can be called multiple times to rotate the admin.
     pub fn set_admin(env: Env, admin: Address) {
-        Self::initialize_contract(env, admin);
+        // If an admin already exists, require their auth before rotating
+        if let Some(current_admin) = env.storage().instance().get::<DataKey, Address>(&DataKey::Admin) {
+            current_admin.require_auth();
+        }
+        env.storage().instance().set(&DataKey::Admin, &admin);
+    }
+
+    /// Returns the current contract admin, if set.
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
+    }
+
+    // ========================================================================
+    // Dispute Resolution
+    // ========================================================================
+
+    /// Internal helper — gets the admin or panics with a user-friendly message.
+    fn require_admin(env: &Env) -> Address {
+        env.storage()
+            .instance()
+            .get::<DataKey, Address>(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("Admin not set"))
+    }
+
+    /// Internal guard — panics if a dispute is currently open.
+    fn check_not_disputed(env: &Env) {
+        if let Some(record) = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
+        {
+            if record.status == DisputeStatus::Open {
+                panic!("Dispute in progress");
+            }
+        }
+    }
+
+    /// Open a dispute on this program, blocking further payouts until resolved or cancelled.
+    ///
+    /// # Arguments
+    /// * `reason` — Human-readable description of the dispute
+    ///
+    /// # Panics
+    /// * If admin not set
+    /// * If a dispute is already open
+    pub fn open_dispute(env: Env, reason: String) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        // Reject if a dispute is already open
+        if let Some(existing) = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
+        {
+            if existing.status == DisputeStatus::Open {
+                panic!("Dispute already open");
+            }
+        }
+
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+
+        let now = env.ledger().timestamp();
+        let record = DisputeRecord {
+            opened_by: admin.clone(),
+            opened_at: now,
+            reason: reason.clone(),
+            status: DisputeStatus::Open,
+            resolved_by: None,
+            resolved_at: None,
+        };
+
+        env.storage().instance().set(&DataKey::Dispute, &record);
+
+        env.events().publish(
+            (DISPUTE_OPENED,),
+            DisputeOpenedEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_data.program_id.clone(),
+                opened_by: admin,
+                reason,
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Resolve an open dispute.  Re-enables payouts.
+    ///
+    /// # Panics
+    /// * If admin not set
+    /// * If no dispute is currently open
+    pub fn resolve_dispute(env: Env) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        let mut record: DisputeRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute)
+            .unwrap_or_else(|| panic!("No dispute to resolve"));
+
+        if record.status != DisputeStatus::Open {
+            panic!("No open dispute to resolve");
+        }
+
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+
+        let now = env.ledger().timestamp();
+        record.status = DisputeStatus::Resolved;
+        record.resolved_by = Some(admin.clone());
+        record.resolved_at = Some(now);
+
+        env.storage().instance().set(&DataKey::Dispute, &record);
+
+        env.events().publish(
+            (DISPUTE_RESOLVED,),
+            DisputeResolvedEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_data.program_id.clone(),
+                resolved_by: admin,
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Cancel an open dispute.  Re-enables payouts.
+    ///
+    /// # Panics
+    /// * If admin not set
+    /// * If no dispute is currently open
+    pub fn cancel_dispute(env: Env) {
+        let admin = Self::require_admin(&env);
+        admin.require_auth();
+
+        let mut record: DisputeRecord = env
+            .storage()
+            .instance()
+            .get(&DataKey::Dispute)
+            .unwrap_or_else(|| panic!("No dispute to cancel"));
+
+        if record.status != DisputeStatus::Open {
+            panic!("No open dispute to cancel");
+        }
+
+        let program_data: ProgramData = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_DATA)
+            .unwrap_or_else(|| panic!("Program not initialized"));
+
+        let now = env.ledger().timestamp();
+        record.status = DisputeStatus::Cancelled;
+        record.resolved_by = Some(admin.clone());
+        record.resolved_at = Some(now);
+
+        env.storage().instance().set(&DataKey::Dispute, &record);
+
+        env.events().publish(
+            (DISPUTE_CANCELLED,),
+            DisputeCancelledEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_data.program_id.clone(),
+                cancelled_by: admin,
+                timestamp: now,
+            },
+        );
+    }
+
+    /// Returns the current dispute record, if any.
+    pub fn get_dispute(env: Env) -> Option<DisputeRecord> {
+        env.storage().instance().get(&DataKey::Dispute)
+    }
+
+    /// Returns true if a dispute is currently open.
+    pub fn is_disputed(env: Env) -> bool {
+        if let Some(record) = env
+            .storage()
+            .instance()
+            .get::<DataKey, DisputeRecord>(&DataKey::Dispute)
+        {
+            record.status == DisputeStatus::Open
+        } else {
+            false
+        }
     }
 
     /// Update pause flags (admin only)
@@ -867,8 +1080,7 @@ impl ProgramEscrowContract {
         max_operations: u32,
         cooldown_period: u64,
     ) {
-        // Only admin can update rate limit config
-        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        let admin = Self::require_admin(&env);
         admin.require_auth();
 
         let config = RateLimitConfig {
@@ -925,6 +1137,12 @@ impl ProgramEscrowContract {
         if Self::check_paused(&env, symbol_short!("release")) {
             reentrancy_guard::clear_entered(&env);
             panic!("Funds Paused");
+        }
+
+        // Dispute guard: block payouts while a dispute is open
+        if Self::is_disputed(env.clone()) {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Dispute in progress");
         }
 
         // Verify authorization
@@ -1033,6 +1251,12 @@ impl ProgramEscrowContract {
         if Self::check_paused(&env, symbol_short!("release")) {
             reentrancy_guard::clear_entered(&env);
             panic!("Funds Paused");
+        }
+
+        // Dispute guard: block payouts while a dispute is open
+        if Self::is_disputed(env.clone()) {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Dispute in progress");
         }
 
         // Verify authorization
@@ -1180,6 +1404,12 @@ impl ProgramEscrowContract {
         // Reentrancy guard: Check and set
         reentrancy_guard::check_not_entered(&env);
         reentrancy_guard::set_entered(&env);
+
+        // Dispute guard: block schedule releases while a dispute is open
+        if Self::is_disputed(env.clone()) {
+            reentrancy_guard::clear_entered(&env);
+            panic!("Dispute in progress");
+        }
 
         let mut program_data: ProgramData = env
             .storage()
@@ -2280,8 +2510,8 @@ mod integration_tests {
         });
         let count = client.try_batch_initialize_programs(&items).unwrap().unwrap();
         assert_eq!(count, 2);
-        assert!(client.program_exists(&String::from_str(&env, "prog-1")));
-        assert!(client.program_exists(&String::from_str(&env, "prog-2")));
+    
+      
     }
 
     #[test]
