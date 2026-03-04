@@ -66,6 +66,14 @@ cd .. && ./contracts/scripts/deploy.sh soroban/target/wasm32-unknown-unknown/rel
 ```
 
 ---
+## Soroban Integration Matrix
+
+This repository includes a matrix runner for validating Soroban contract behavior across multiple SDK versions and network targets.
+
+### Matrix Runner
+
+```bash
+./scripts/run_contract_matrix.sh --sdk-version <version> --network <local|testnet> [options]
 
 ## Configuration
 

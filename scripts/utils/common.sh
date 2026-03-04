@@ -175,12 +175,18 @@ load_config() {
         # Skip if key is empty after trimming
         [[ -z "$key" ]] && continue
 
+        # Normalize Windows CRLF line endings, then remove surrounding quotes
+        value="${value//$'\r'/}"
+
+        # Trim leading/trailing whitespace after CRLF cleanup
+        value="$(echo "$value" | xargs)"
+
         # Remove surrounding quotes from value if present
         value="${value%\"}"
         value="${value#\"}"
         value="${value%\'}"
         value="${value#\'}"
-
+        
         # Export the variable
         export "$key=$value"
         log_debug "Loaded: $key"

@@ -65,4 +65,64 @@ jobs:
       - name: Build program-escrow crate
         working-directory: ./program-escrow
         run: cargo build
+  soroban-contract-matrix:
+    name: Soroban Contracts Matrix
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: "23"
+            network: "local"
+            deploy_check: "actual"
+          - sdk: "23.0.3"
+            network: "local"
+            deploy_check: "actual"
+          - sdk: "23"
+            network: "testnet"
+            deploy_check: "dry-run"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            soroban/target
+          key: ${{ runner.os }}-soroban-cargo-${{ matrix.sdk }}-${{ hashFiles('soroban/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-soroban-cargo-${{ matrix.sdk }}-
+            ${{ runner.os }}-soroban-cargo-
+
+      - name: Install Stellar CLI
+        run: cargo install --locked stellar-cli
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Start local sandbox
+        if: matrix.network == 'local'
+        run: |
+          stellar container start local --limits testnet
+          stellar network rm local || true
+          stellar network add --rpc-url http://localhost:8000/rpc --network-passphrase "Standalone Network ; February 2017" local
+
+      - name: Run Soroban contract matrix
+        run: |
+          chmod +x scripts/run_contract_matrix.sh
+          ./scripts/run_contract_matrix.sh \
+            --sdk-version "${{ matrix.sdk }}" \
+            --network "${{ matrix.network }}" \
+            --deploy-check "${{ matrix.deploy_check }}"      
 
